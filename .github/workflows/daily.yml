@@ -3,7 +3,12 @@ name: Daily update
 on:
   schedule:
     - cron: "20 21 * * 1-5"   # 5:20pm ET (4:20pm in winter), Mon-Fri, after the close
+    - cron: "40 2 * * 2-6"    # backup ~10:40pm ET: catches the day's close if the first run got late or partial Yahoo data
   workflow_dispatch:           # adds a "Run workflow" button
+
+concurrency:
+  group: daily-update
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -27,4 +32,5 @@ jobs:
           git config user.email "bot@users.noreply.github.com"
           git add data.js
           git diff --cached --quiet || git commit -m "Daily update"
+          git pull --rebase -X theirs origin main || true
           git push
