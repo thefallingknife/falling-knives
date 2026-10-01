@@ -1226,6 +1226,11 @@ if(WATCH.length&&curTab!=="watch")renderWatch();
   const asof=M.asof, asofMonth=asof.slice(0,7);
   const weekKey=d=>{const x=new Date(d);const day=(x.getUTCDay()+6)%7;x.setUTCDate(x.getUTCDate()-day);return x.toISOString().slice(0,10)};
   const asofWeek=weekKey(asof+"T12:00:00Z");
+  // true when no earlier weekday in the same month ("m") or week ("w") was a trading day (Jan 1 is the only month-opening holiday)
+  const firstSession=(d,kind)=>{const x=new Date(d+"T12:00:00Z");for(let i=1;i<7;i++){const p=new Date(x);p.setUTCDate(x.getUTCDate()-i);
+    if(kind==="m"&&p.getUTCMonth()!==x.getUTCMonth())return true;
+    const wd=p.getUTCDay();if(kind==="w"&&(wd===0||wd===6))return true;
+    if(wd!==0&&wd!==6&&!(p.getUTCMonth()===0&&p.getUTCDate()===1))return false}return true};
   // per-symbol reference data
   const REF={};
   const addRef=(s,last,mtdSnap,wkPct)=>{if(REF[s])return;const base=BASE[s]||(last/(1+mtdSnap/100));REF[s]={last,base,wkb:wkPct!=null?last/(1+wkPct/100):null}};
@@ -1239,7 +1244,10 @@ if(WATCH.length&&curTab!=="watch")renderWatch();
     const ref=REF[s];if(!ref||!q||!q.c)return;
     const t=q.t||Math.floor(Date.now()/1000);lastTradeTs=Math.max(lastTradeTs,t);
     const tDate=new Date(t*1000).toLocaleDateString("en-CA",{timeZone:"America/New_York"});
-    const base=tDate.slice(0,7)!==asofMonth?ref.last:ref.base;       // new month -> base is last snapshot close
+    // New month: on its first session the quote's previous close IS last month's final close, which is right
+    // even if the nightly snapshot is a day behind. Later in the month fall back to the snapshot close.
+    const newMonth=tDate.slice(0,7)!==asofMonth;
+    const base=newMonth?(q.pc&&firstSession(tDate,"m")?q.pc:(ref.last||q.pc)):ref.base;
     const newWeek=weekKey(tDate+"T12:00:00Z")!==asofWeek;
     const mtd=(q.c/base-1)*100;
     if(s==="SPY"){const el=document.getElementById("spxv");if(el){el.textContent=pct(mtd,1);el.className="num "+cls(mtd)}const l=document.getElementById("spxl");if(l)l.textContent="S&P 500 this month · live";return}
@@ -1250,7 +1258,7 @@ if(WATCH.length&&curTab!=="watch")renderWatch();
       r.dd52=q.c>=r.hi52?0:(q.c/r.hi52-1)*100;
       r.offLo=q.c<=r.lo52?0:(q.c/r.lo52-1)*100;
       if(ref.wkb){
-        if(newWeek&&!r._rolled){r.wks=r.wks.slice(1).concat([0]);r._rolled=true;ref.wkb=ref.last}
+        if(newWeek&&!r._rolled){r.wks=r.wks.slice(1).concat([0]);r._rolled=true;ref.wkb=q.pc&&firstSession(tDate,"w")?q.pc:ref.last}
         r.curWk=(q.c/ref.wkb-1)*100;r.wks[r.wks.length-1]=r.curWk;
       }
       r.upside=r.tgt?(r.tgt/q.c-1)*100:null;

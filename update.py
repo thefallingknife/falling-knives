@@ -60,26 +60,95 @@ def pick_pattern(r, sector, sub, secmed, spx_mtd):
             "sm": r2(sm) if sm is not None else None}
 
 
-def download(symbols):
+def download(symbols, period="2y", min_len=61):
     frames = {}
     for i in range(0, len(symbols), 100):
         chunk = symbols[i:i + 100]
+        raw = None
         for attempt in range(3):
             try:
-                raw = yf.download(chunk, period="2y", interval="1d", auto_adjust=False,
+                raw = yf.download(chunk, period=period, interval="1d", auto_adjust=False,
                                   group_by="ticker", threads=True, progress=False)
                 break
             except Exception as e:  # noqa
+                raw = None
                 print("download retry", e, file=sys.stderr); time.sleep(5)
+        if raw is None or len(raw) == 0:
+            print(f"download failed for chunk starting {chunk[0]}", file=sys.stderr)
+            continue
         for s in chunk:
             try:
                 sub = raw[s] if len(chunk) > 1 else raw
                 sub = sub[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
-                if len(sub) > 60:
+                if len(sub) >= min_len:
                     frames[s] = sub
             except Exception:
                 pass
     return frames
+
+
+def ny_now():
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo("America/New_York"))
+    except Exception:  # noqa
+        return dt.datetime.utcnow() - dt.timedelta(hours=4)
+
+
+def expected_session(now=None):
+    """Most recent trading day whose 4pm close has already happened (with a 15-minute buffer)."""
+    now = now or ny_now()
+    d = now.date()
+    if not is_trading_day(d) or now.hour * 60 + now.minute < 16 * 60 + 15:
+        d -= dt.timedelta(days=1)
+    while not is_trading_day(d):
+        d -= dt.timedelta(days=1)
+    return d
+
+
+def _upto(f, d):
+    return f[[x.date() <= d for x in f.index]]
+
+
+def align_frames(frames, syms, now=None):
+    """Make every symbol end on the same completed session.
+
+    Yahoo often serves the newest daily bar for only some symbols in the first hours after the
+    close, and serves a partial bar during market hours. Previously one early symbol could set the
+    date and knock out the other 500 (run fails), or every symbol lagged a day (stale site).
+    Here: drop partial bars, re-fetch symbols missing the latest session, and only then pick the date.
+    """
+    exp = expected_session(now)
+    frames = {s: _upto(f, exp) for s, f in frames.items()}
+    frames = {s: f for s, f in frames.items() if len(f)}
+    missing = [s for s in syms if s not in frames]
+    if missing:
+        print(f"re-downloading {len(missing)} symbols with no data", file=sys.stderr)
+        time.sleep(5)
+        for s, f in download(missing).items():
+            f = _upto(f, exp)
+            if len(f): frames[s] = f
+    for attempt in range(3):
+        stale = [s for s in syms if s in frames and frames[s].index[-1].date() < exp]
+        if not stale:
+            break
+        print(f"{len(stale)} symbols missing the {exp} bar; refetching (try {attempt + 1})", file=sys.stderr)
+        time.sleep(10 * (attempt + 1))
+        for s, f in download(stale, period="5d", min_len=1).items():
+            f = _upto(f, exp)
+            if not len(f): continue
+            c = pd.concat([frames[s], f])
+            frames[s] = c[~c.index.duplicated(keep="last")].sort_index()
+    ends = {}
+    for s in syms:
+        if s in frames:
+            d = frames[s].index[-1].date(); ends[d] = ends.get(d, 0) + 1
+    if not ends:
+        sys.exit("No price data downloaded; not publishing.")
+    last_date = exp if ends.get(exp, 0) >= 450 else max(ends, key=lambda d: (ends[d], d))
+    frames = {s: _upto(f, last_date) for s, f in frames.items()}
+    print(f"expected session {exp}; using {last_date} ({ends.get(last_date, 0)} symbols end there)")
+    return frames, last_date
 
 
 def metrics(s, df, month_start):
@@ -679,6 +748,55 @@ def post_final_issue(bentry, pentry, month_name):
         print("final basket issue failed", e, file=sys.stderr)
 
 
+def prev_month_end(d):
+    e = d.replace(day=1) - dt.timedelta(days=1)
+    while not is_trading_day(e):
+        e -= dt.timedelta(days=1)
+    return e
+
+
+def finalize_missed_month(frames, uni, last_date, reasons):
+    """If the run on last month's final trading day was missed (failed or stale data), rebuild
+    last month's basket from the true month-end close so it locks on the right prices."""
+    pe = prev_month_end(last_date)
+    key = pe.strftime("%Y-%m")
+    blog = load_json("basketlog.json", {})
+    cur = blog.get(key)
+    if cur and cur.get("src") != "live":
+        return
+    if cur and cur.get("final") and cur.get("asof") == pe.isoformat():
+        return
+    fr = {s: _upto(f, pe) for s, f in frames.items()}
+    if "^GSPC" not in fr or not len(fr["^GSPC"]) or fr["^GSPC"].index[-1].date() != pe:
+        return
+    ms = pe.replace(day=1)
+    Mp = {}
+    for s in uni:
+        f = fr.get(s)
+        if f is not None and len(f) > 60 and f.index[-1].date() == pe:
+            try:
+                Mp[s] = metrics(s, f, ms)
+            except Exception:
+                pass
+    if len(Mp) < 450:
+        return
+    spx = metrics("^GSPC", fr["^GSPC"], ms)
+    secmed = {}
+    for sec in {u["sector"] for u in uni.values()}:
+        v = sorted(Mp[x]["mtd"] for x in Mp if uni[x]["sector"] == sec)
+        if v: secmed[sec] = v[len(v) // 2]
+    rows = []
+    for r in sorted(Mp.values(), key=lambda r: r["mtd"])[:TOP_N]:
+        s = r["s"]
+        rows.append(dict(r, name=uni[s]["name"], pat=pick_pattern(r, uni[s]["sector"], uni[s].get("sub"), secmed, spx["mtd"])))
+    print(f"catch-up: rebuilding {key} basket from the {pe} close")
+    update_pick_log(rows, pe)
+    picks = load_json("picks.json", {})
+    conf = lambda s: reasons[s][1] if isinstance(reasons.get(s), list) and len(reasons[s]) == 3 else "Pending"
+    picks[key] = {"asof": pe.isoformat(), "syms": [[r["s"], conf(r["s"])] for r in rows]}
+    write_json("picks.json", picks)
+
+
 def auto_stories(D, month_name):
     themes = {}
     for r in D:
@@ -699,7 +817,7 @@ def main():
     uni = load_universe()
     syms = sorted(uni)
     frames = download(syms + ["^GSPC", "SPY"])
-    last_date = max(f.index[-1].date() for s, f in frames.items() if s in uni)
+    frames, last_date = align_frames(frames, syms + ["^GSPC", "SPY"])
     month_start = last_date.replace(day=1)
     M = {}
     for s in syms:
@@ -826,6 +944,10 @@ def main():
         o["wc"] = [[d.strftime("%Y-%m-%d"), r2(v)] for d, v in wk.items()]
         ALLS[s] = o
     write_json("all.json", {"asof": last_date.isoformat(), "S": ALLS, "BASE": {s: M[s]["base"] for s in M}})
+    try:
+        finalize_missed_month(frames, uni, last_date, reasons)
+    except Exception as e:  # noqa
+        print("month-end catch-up failed", e, file=sys.stderr)
     plog, blog, pkey = update_pick_log(D, last_date)
     PK = pick_performance(plog, blog, frames.get("SPY"))
     PK["cur"] = dict(plog[pkey], m=pkey) if pkey else None
@@ -839,10 +961,13 @@ def main():
     payload = {"D": D, "BC": BC, "BIG": BIG, "M": meta, "BASE": BASE, "G": G, "V": V, "VB": VB, "TR": TR, "PK": PK}
     with open("data.js", "w") as f:
         f.write("window.FK=" + json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + ";\n")
-    try:
-        post_digest(build_digest(meta, D, BC, G, V, prev_syms, last_date))
-    except Exception as e:  # noqa
-        print("digest build failed", e, file=sys.stderr)
+    if prev and prev.get("M", {}).get("asof") == meta["asof"]:
+        print("digest skipped: already sent for", meta["asof"])
+    else:
+        try:
+            post_digest(build_digest(meta, D, BC, G, V, prev_syms, last_date))
+        except Exception as e:  # noqa
+            print("digest build failed", e, file=sys.stderr)
     pend = [o["s"] for o in D + BC if o["conf"] == "Pending"]
     print(f"wrote data.js: {len(D)} knives, {len(BC)} falling blue chips, {len(G)} winners, {len(V)} volatile, {len(VB)} blue chips by volatility; pending reasons: {pend}")
 
